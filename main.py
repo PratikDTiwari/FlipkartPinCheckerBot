@@ -8,10 +8,10 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.getenv("8784990195:AAHJKR3nVqvd4P2y2AqpvZahvQ5fBW2JzfQ")
+TELEGRAM_BOT_TOKEN = os.getenv("8784990195:AAGBiLJ42VhBweXHF6ghg1m9kcxz2xxgmCk") or "YOUR_NEW_BOT_TOKEN_HERE"
 
 SERVICEABILITY_URL = "https://2.rome.api.flipkart.net/3/product/serviceability"
 USER_AGENT = "Mozilla/5.0 (Linux; Android 11; Pixel 5 Build/RQ3A.211001.001) FKUA/Retail/2270300/Android/Tablet (Google/Pixel 5/7f807eaf4b2cdcf4a607bad2f8811b0d)"
@@ -26,10 +26,8 @@ DEFAULT_HEADERS = {
 TRACKED_DOMAINS = {"www.flipkart.com", "flipkart.com", "dl.flipkart.com"}
 
 PID_REGEX = re.compile(r"[?&]pid=([A-Za-z0-9]+)")
-PID_ENCODED_REGEX = re.compile(r"pid%3D([A-Za-z0-9]+)", re.IGNORECASE)
-FLIPKART_URL_REGEX = re.compile(
-    r"(https?://(?:www\.)?flipkart\.com/[^\s]+|https?://dl\.flipkart\.com/[^\s]+)"
-)
+PID_ENCODED_REGEX = re.compile(r"pid%3D([A-Za-z0-9]+)", re.I)
+FLIPKART_URL_REGEX = re.compile(r"(https?://(?:www\.)?flipkart\.com/[^\s]+|https?://dl\.flipkart\.com/[^\s]+)")
 
 PINCODE_CITY_MAPPING = {
     "Panipat": ["132103", "132106", "132108", "132105"],
@@ -64,41 +62,40 @@ PINCODE_CITY_MAPPING = {
     "Hyderabad": ["500001", "500002", "500003", "500004", "500007", "500008", "500012"],
 }
 
-PINCODES_TO_CHECK = [
-    pin for city_pincodes in PINCODE_CITY_MAPPING.values() for pin in city_pincodes
-]
+PINCODES_TO_CHECK = [pin for pins in PINCODE_CITY_MAPPING.values() for pin in pins]
 
 def get_city(pin: str) -> str:
-    return next((city for city, pins in PINCODE_CITY_MAPPING.items() if pin in pins), "Unknown")
+    for city, pins in PINCODE_CITY_MAPPING.items():
+        if pin in pins:
+            return city
+    return "Unknown"
 
 def extract_urls(text: str) -> list[str]:
     return FLIPKART_URL_REGEX.findall(text or "")
 
 def get_domain(url: str) -> str:
     try:
-        parsed = urlparse(url if url.startswith(("http://", "https://")) else "https://" + url)
-        return parsed.netloc.lower()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        return urlparse(url).netloc.lower()
     except Exception:
         return ""
 
 def extract_pid(url: str) -> Optional[str]:
     if not url:
         return None
-
-    match = PID_REGEX.search(url)
-    if match:
-        return match.group(1)
-
-    match = PID_ENCODED_REGEX.search(url)
-    if match:
-        return match.group(1)
-
+    m = PID_REGEX.search(url)
+    if m:
+        return m.group(1)
+    m = PID_ENCODED_REGEX.search(url)
+    if m:
+        return m.group(1)
     return None
 
 async def resolve_url(session: requests.AsyncSession, url: str) -> Optional[str]:
     try:
-        response = await session.get(url, impersonate="chrome110", timeout=30)
-        return str(response.url)
+        r = await session.get(url, impersonate="chrome110", timeout=30)
+        return str(r.url)
     except Exception as e:
         logger.warning(f"Failed to resolve URL {url}: {e}")
         return None
@@ -111,7 +108,6 @@ async def get_product_id(text: str) -> Optional[str]:
     async with requests.AsyncSession() as session:
         for url in urls:
             domain = get_domain(url)
-
             if domain not in TRACKED_DOMAINS:
                 continue
 
@@ -137,104 +133,86 @@ def build_payload(pid: str, pin: str) -> dict:
         },
     }
 
-async def check_pin(
-    pin: str,
-    pid: str,
-    session: requests.AsyncSession,
-    sem: asyncio.Semaphore,
-) -> tuple[str, bool]:
+async def check_pin(pin: str, pid: str, session: requests.AsyncSession, sem: asyncio.Semaphore):
     try:
         async with sem:
-            resp = await session.post(
+            r = await session.post(
                 SERVICEABILITY_URL,
                 json=build_payload(pid, pin),
                 headers=DEFAULT_HEADERS,
                 impersonate="chrome110",
                 timeout=30,
             )
-            resp.raise_for_status()
-            data = resp.json()
-
-            serviceable = bool(
+            r.raise_for_status()
+            data = r.json()
+            ok = bool(
                 data.get("RESPONSE", {})
                 .get(pid, {})
                 .get("listingSummary", {})
                 .get("serviceable", False)
             )
-
-            return pin, serviceable
-
+            return pin, ok
     except Exception as e:
         logger.error(f"Error checking {pin}: {e}")
         return pin, False
 
-async def check_all_pins(pid: str, pins: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+async def check_all_pins(pid: str):
     sem = asyncio.Semaphore(50)
 
     async with requests.AsyncSession() as session:
         results = await asyncio.gather(
-            *[check_pin(pin, pid, session, sem) for pin in pins]
+            *[check_pin(pin, pid, session, sem) for pin in PINCODES_TO_CHECK]
         )
 
-    available = [pin for pin, ok in results if ok]
+    city_pins = {}
 
-    cities: dict[str, list[str]] = {}
-    for pin in available:
-        city = get_city(pin)
-        cities.setdefault(city, []).append(pin)
+    for pin, ok in results:
+        if ok:
+            city = get_city(pin)
+            city_pins.setdefault(city, []).append(pin)
 
-    for city in cities:
-        cities[city].sort()
+    for city in city_pins:
+        city_pins[city].sort()
 
-    return sorted(cities.keys()), cities
+    return city_pins
 
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
+    msg = update.effective_message
     chat = update.effective_chat
 
-    if not message or not chat:
+    if not msg or not chat:
         return
 
-    text = message.text or ""
+    text = msg.text or ""
 
-    if not any(d in text for d in ("flipkart.com", "dl.flipkart.com")):
+    if "flipkart.com" not in text and "dl.flipkart.com" not in text:
         return
 
     pid = await get_product_id(text)
+
     if not pid:
-        await message.reply_text("❌ Could not find product ID from this Flipkart link.")
+        await msg.reply_text("❌ Could not find product ID.")
         return
 
-    await context.bot.send_message(
-        chat.id,
-        f"🔎 Checking {len(PINCODES_TO_CHECK)} pincodes...",
-    )
+    await msg.reply_text(f"🔎 Checking {len(PINCODES_TO_CHECK)} pincodes...")
 
-    cities, city_pins = await check_all_pins(pid, PINCODES_TO_CHECK)
+    city_pins = await check_all_pins(pid)
 
-    if not cities:
-        await message.reply_text("❌ Product is not available ❌")
+    if not city_pins:
+        await msg.reply_text("❌ Product is not available ❌")
         return
 
     total = sum(len(pins) for pins in city_pins.values())
-
     lines = [f"✅ Available in {total} pincodes ✅"]
 
-    for city in cities:
+    for city in sorted(city_pins):
         pins = city_pins[city]
+        lines.append(f"• {city}: {', '.join(pins)}")
 
-        if len(pins) <= 5:
-            lines.append(f"• {city}: {', '.join(pins)}")
-        else:
-            short_codes = ", ".join(pin[-3:] for pin in pins)
-            lines.append(f"• {city}: {pins[0][:3]}0xx ({len(pins)} codes: {short_codes})")
-
-    await message.reply_text("\n".join(lines))
+    await msg.reply_text("\n".join(lines))
 
 def main():
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "PASTE_NEW_TOKEN_HERE":
-        print("Set TELEGRAM_BOT_TOKEN environment variable or paste your new bot token.")
-        return
+    print("🤖 Bot starting...")
 
     app = (
         Application.builder()
@@ -248,16 +226,11 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
 
-    print("🤖 started")
-
-    try:
-        app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            close_loop=False,
-        )
-    except Exception as e:
-        print(f"Error: {e}")
+    print("🤖 Bot running...")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
