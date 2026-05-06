@@ -47,7 +47,8 @@ PINCODE_CITY_MAPPING = {
     "Suratgarh": ["335804"],
     "Indore": ["453331"],
     "Ghaziabad": ["201013"],
-    "Mumbai": ["400095", "400067", "400020"]
+    "Mumbai": ["400095", "400067", "400020"],
+    "Bihar": ["801503"]
 }
 
 PINCODES_TO_CHECK = [pin for city_pincodes in PINCODE_CITY_MAPPING.values() for pin in city_pincodes]
